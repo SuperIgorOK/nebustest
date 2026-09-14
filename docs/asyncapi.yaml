@@ -1,0 +1,270 @@
+asyncapi: 3.0.0
+info:
+  title: Payments messaging
+  version: 1.0.0
+  description: 'Контракт RabbitMQ для сервиса целиком: outbox публикует, consumer получает и отправляет
+    retry/DLQ. Описаны значения .env.example: три попытки, задержки 1 и 2 секунды. При изменении
+    топологии через окружение контракт нужно обновить. Доставка at-least-once; стабильный AMQP message_id
+    равен UUID записи outbox и сохраняется при повторах. Это свойство AMQP, а не JSON payload или
+    пользовательский header. После HTTP webhook либо подтверждённой передачи в retry/DLQ consumer
+    делает manual ACK. Ошибка публикации приводит к NACK/requeue после паузы BROKER_RETRY_DELAY_SECONDS (по умолчанию 5 секунд). TTL-очереди возвращают сообщения
+    в payments.events через dead-lettering; отдельного consumer в них нет. HTTP webhook описан в
+    README.'
+  externalDocs:
+    description: AsyncAPI specification
+    url: https://www.asyncapi.com/docs/reference/specification/v3.0.0
+defaultContentType: application/json
+servers:
+  rabbitmq:
+    host: localhost:5672
+    protocol: amqp
+    protocolVersion: 0.9.1
+    description: 'В Docker: rabbitmq:5672. Учётные данные задаются RABBITMQ_DEFAULT_USER/PASS.'
+    security:
+    - $ref: '#/components/securitySchemes/rabbitCredentials'
+channels:
+  payments:
+    address: payments.new
+    servers:
+    - $ref: '#/servers/rabbitmq'
+    messages:
+      PaymentRequested:
+        $ref: '#/components/messages/PaymentRequested'
+    bindings:
+      amqp:
+        is: routingKey
+        exchange:
+          name: payments.events
+          type: direct
+          durable: true
+          autoDelete: false
+          vhost: /
+        bindingVersion: 0.3.0
+    x-rabbitmq-queue:
+      name: payments.new
+      durable: true
+      arguments:
+        x-dead-letter-exchange: payments.dlx
+        x-dead-letter-routing-key: payments.dlq
+        x-queue-type: classic
+  retry2:
+    address: payments.new.retry.2
+    servers:
+    - $ref: '#/servers/rabbitmq'
+    messages:
+      PaymentRetry:
+        $ref: '#/components/messages/PaymentRetry'
+    bindings:
+      amqp:
+        is: routingKey
+        exchange:
+          name: payments.retry
+          type: direct
+          durable: true
+          autoDelete: false
+          vhost: /
+        bindingVersion: 0.3.0
+    x-rabbitmq-queue:
+      name: payments.new.retry.2
+      durable: true
+      arguments:
+        x-message-ttl: 1000
+        x-dead-letter-exchange: payments.events
+        x-dead-letter-routing-key: payments.new
+        x-queue-type: classic
+  retry3:
+    address: payments.new.retry.3
+    servers:
+    - $ref: '#/servers/rabbitmq'
+    messages:
+      PaymentRetry:
+        $ref: '#/components/messages/PaymentRetry'
+    bindings:
+      amqp:
+        is: routingKey
+        exchange:
+          name: payments.retry
+          type: direct
+          durable: true
+          autoDelete: false
+          vhost: /
+        bindingVersion: 0.3.0
+    x-rabbitmq-queue:
+      name: payments.new.retry.3
+      durable: true
+      arguments:
+        x-message-ttl: 2000
+        x-dead-letter-exchange: payments.events
+        x-dead-letter-routing-key: payments.new
+        x-queue-type: classic
+  deadLetters:
+    address: payments.dlq
+    servers:
+    - $ref: '#/servers/rabbitmq'
+    messages:
+      DeadLetter:
+        $ref: '#/components/messages/DeadLetter'
+    bindings:
+      amqp:
+        is: routingKey
+        exchange:
+          name: payments.dlx
+          type: direct
+          durable: true
+          autoDelete: false
+          vhost: /
+        bindingVersion: 0.3.0
+    x-rabbitmq-queue:
+      name: payments.dlq
+      durable: true
+      arguments:
+        x-queue-type: classic
+operations:
+  publishPayment:
+    action: send
+    channel:
+      $ref: '#/channels/payments'
+    messages:
+    - $ref: '#/channels/payments/messages/PaymentRequested'
+    summary: Outbox публикует после commit платежа.
+    bindings:
+      amqp:
+        deliveryMode: 2
+        bindingVersion: 0.3.0
+  processPayment:
+    action: receive
+    channel:
+      $ref: '#/channels/payments'
+    messages:
+    - $ref: '#/channels/payments/messages/PaymentRequested'
+    summary: Один consumer обрабатывает платеж и доставляет webhook. Включает сообщения, вернувшиеся
+      из retry.
+    bindings:
+      amqp:
+        deliveryMode: 2
+        bindingVersion: 0.3.0
+        ack: true
+  scheduleSecondAttempt:
+    action: send
+    channel:
+      $ref: '#/channels/retry2'
+    messages:
+    - $ref: '#/channels/retry2/messages/PaymentRetry'
+    summary: Повтор №2 через 1 секунду.
+    bindings:
+      amqp:
+        deliveryMode: 2
+        bindingVersion: 0.3.0
+  scheduleThirdAttempt:
+    action: send
+    channel:
+      $ref: '#/channels/retry3'
+    messages:
+    - $ref: '#/channels/retry3/messages/PaymentRetry'
+    summary: Повтор №3 через 2 секунды.
+    bindings:
+      amqp:
+        deliveryMode: 2
+        bindingVersion: 0.3.0
+  deadLetter:
+    action: send
+    channel:
+      $ref: '#/channels/deadLetters'
+    messages:
+    - $ref: '#/channels/deadLetters/messages/DeadLetter'
+    summary: После исчерпания попыток или сразу при постоянной ошибке/некорректном сообщении.
+    bindings:
+      amqp:
+        deliveryMode: 2
+        bindingVersion: 0.3.0
+components:
+  securitySchemes:
+    rabbitCredentials:
+      type: userPassword
+  schemas:
+    PaymentPayload:
+      type: object
+      required:
+      - payment_id
+      properties:
+        payment_id:
+          type: string
+          format: uuid
+  messages:
+    PaymentRequested:
+      name: PaymentRequested
+      title: Платеж принят
+      headers:
+        type: object
+        required:
+        - x-attempt
+        properties:
+          x-attempt:
+            type: integer
+            minimum: 1
+            maximum: 3
+      payload:
+        $ref: '#/components/schemas/PaymentPayload'
+      examples:
+      - payload:
+          payment_id: b89e1b61-31f2-4c75-b672-319517ab26c2
+        headers:
+          x-attempt: 1
+    PaymentRetry:
+      name: PaymentRetry
+      title: Повтор обработки
+      headers:
+        type: object
+        required:
+        - x-attempt
+        - x-error
+        - x-original-message-id
+        properties:
+          x-attempt:
+            type: integer
+            minimum: 1
+            maximum: 3
+          x-error:
+            type: string
+          x-original-message-id:
+            type: string
+            description: AMQP message_id исходного сообщения; пустая строка, если он отсутствовал.
+      payload:
+        $ref: '#/components/schemas/PaymentPayload'
+      examples:
+      - payload:
+          payment_id: b89e1b61-31f2-4c75-b672-319517ab26c2
+        headers:
+          x-attempt: 2
+          x-error: Webhook timeout
+          x-original-message-id: 586a8cf8-1f4f-4d21-848f-1cd2d59756bc
+    DeadLetter:
+      name: DeadLetter
+      title: Необработанное сообщение
+      description: 'Корректный или некорректный исходный объект сохраняется. Не-объект оборачивается
+        в {malformed_payload: repr(payload)}. x-original-routing-key добавляется router; при broker
+        dead-lettering он может отсутствовать.'
+      headers:
+        type: object
+        properties:
+          x-attempt:
+            type: integer
+            minimum: 1
+            maximum: 3
+          x-error:
+            type: string
+          x-original-message-id:
+            type: string
+            description: AMQP message_id исходного сообщения; пустая строка, если он отсутствовал.
+          x-original-routing-key:
+            type: string
+      payload:
+        type: object
+      examples:
+      - payload:
+          malformed_payload: '''not-a-dict'''
+        headers:
+          x-attempt: 1
+          x-error: malformed payment message
+          x-original-message-id: ''
+          x-original-routing-key: payments.new
